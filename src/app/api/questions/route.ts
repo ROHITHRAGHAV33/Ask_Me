@@ -1,31 +1,57 @@
-import { supabase } from "@/lib/supabase";
-import { getQuestionsPage, searchQuestions } from "@/lib/questions";
+import { NextRequest, NextResponse } from "next/server";
+import {
+  getQuestions,
+  getVoterVotes,
+  getLeaderboard,
+  getOrCreateVoter,
+  updateUsername,
+  Vote,
+} from "@/lib/questions";
 
-const PAGE_SIZE = 10;
-
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const q = searchParams.get("q")?.trim();
+  const voterId = searchParams.get("voterId");
 
-  if (q) {
-    const questions = await searchQuestions(q, PAGE_SIZE);
-    return Response.json({ questions, hasMore: false });
+  try {
+    const questions = await getQuestions();
+    const leaderboard = await getLeaderboard();
+
+    let voter = null;
+    let votes: Vote[] = [];
+
+    if (voterId) {
+      voter = await getOrCreateVoter(voterId);
+      votes = await getVoterVotes(voterId);
+    }
+
+    return NextResponse.json({
+      questions,
+      votes,
+      voter,
+      leaderboard,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error occurred";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  const offset = Number(searchParams.get("offset") ?? 0);
-  const { questions, hasMore } = await getQuestionsPage(offset, PAGE_SIZE);
-  return Response.json({ questions, hasMore });
 }
 
-export async function POST(req: Request) {
-  const { body, author } = await req.json();
+export async function POST(req: NextRequest) {
+  try {
+    const { voterId, username } = await req.json();
 
-  const { data, error } = await supabase
-    .from("questions")
-    .insert({ body, author })
-    .select()
-    .single();
+    if (!voterId || !username?.trim()) {
+      return NextResponse.json({ error: "Missing voterId or username" }, { status: 400 });
+    }
 
-  if (error) return Response.json({ error: error.message }, { status: 500 });
-  return Response.json(data);
+    const updated = await updateUsername(voterId, username.trim());
+    if (!updated) {
+      return NextResponse.json({ error: "Failed to update username" }, { status: 500 });
+    }
+
+    return NextResponse.json(updated);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error occurred";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }

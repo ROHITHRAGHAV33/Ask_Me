@@ -1,26 +1,93 @@
+import { NextRequest, NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
 
-// We don't check-then-insert (that has a time-of-check-to-time-of-use race).
-// We just try to insert and let the unique(question_id, voter_id) constraint
-// be the referee — it's enforced atomically as part of the insert.
 export async function POST(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { id: questionId } = await params;
-  const { voterId } = await req.json();
+  try {
+    const { id: questionId } = await params;
+    const { voterId, selectedOption } = await req.json();
 
-  const { error } = await supabase
-    .from("votes")
-    .insert({ question_id: questionId, voter_id: voterId });
-
-  if (error) {
-    if (error.code === "23505") {
-      // Postgres unique violation → this voter already voted on this question.
-      return Response.json({ error: "already voted" }, { status: 409 });
+    if (!voterId || selectedOption === undefined) {
+      return NextResponse.json(
+        { error: "Missing voterId or selectedOption" },
+        { status: 400 }
+      );
     }
-    return Response.json({ error: error.message }, { status: 500 });
-  }
 
-  return Response.json({ ok: true });
+    // 1. Fetch the question to get the correct answer, explanation, and point value
+    const { data: question, error: questionError } = await supabase
+      .from("questions")
+      .select("correct_option, explanation, points")
+      .eq("id", questionId)
+      .single();
+
+    if (questionError || !question) {
+      return NextResponse.json({ error: "Question not found" }, { status: 404 });
+    }
+
+    const isCorrect = question.correct_option === selectedOption;
+
+    // 2. Insert the vote. Postgres unique constraint (question_id, voter_id)
+    // prevents double voting.
+    const { error: voteError } = await supabase.from("votes").insert({
+      question_id: questionId,
+      voter_id: voterId,
+      selected_option: selectedOption,
+      is_correct: isCorrect,
+    });
+
+    if (voteError) {
+      if (voteError.code === "23505") {
+        // Unique violation
+        return NextResponse.json(
+          { error: "You have already voted on this question" },
+          { status: 409 }
+        );
+      }
+      return NextResponse.json({ error: voteError.message }, { status: 500 });
+    }
+
+    // 3. If correct, award coins to the voter
+    let updatedCoins = 0;
+    if (isCorrect) {
+      // Fallback to manual update: fetch current coins, then increment
+      const { data: fetchedVoter } = await supabase
+        .from("voters")
+        .select("coins")
+        .eq("voter_id", voterId)
+        .single();
+
+      const newCoins = (fetchedVoter?.coins ?? 0) + question.points;
+
+      const { data: updatedVoter } = await supabase
+        .from("voters")
+        .update({ coins: newCoins })
+        .eq("voter_id", voterId)
+        .select("coins")
+        .single();
+
+      updatedCoins = updatedVoter?.coins ?? newCoins;
+    } else {
+      // Just fetch current coins
+      const { data: voter } = await supabase
+        .from("voters")
+        .select("coins")
+        .eq("voter_id", voterId)
+        .single();
+      updatedCoins = voter?.coins ?? 0;
+    }
+
+    return NextResponse.json({
+      ok: true,
+      isCorrect,
+      correctOption: question.correct_option,
+      explanation: question.explanation,
+      coins: updatedCoins,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error occurred";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }
